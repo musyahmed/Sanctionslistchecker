@@ -52,7 +52,7 @@ mock_vector_db_data = {
         "address": "123 Main St, Anytown, USA",
         "phone_number": "555-123-4567",
         "email": "morgan.reynolds@example.com",
-        "recent_transactions_embeddings": [0.1, 0.2, 0.3, 0.4, 0.5] 
+        "recent_transactions_embeddings": [0.1, 0.2, 0.3, 0.4, 0.5]
     },
     "user456": {
         "user_id": "user456",
@@ -157,7 +157,7 @@ def main():
 
     # Load details using the provided User ID
     details = get_user_data_from_vector_db(current_user_id, vector_db_client)
-    
+
     if not details:
         print("User ID not found. Exiting.")
         return

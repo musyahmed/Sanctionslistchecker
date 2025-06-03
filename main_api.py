@@ -111,8 +111,46 @@ class TokenData(BaseModel):
 # Stores username as key and UserInDB model as value
 mock_user_db: dict[str, UserInDB] = {}
 
-# --- Token Blocklist (for revoked tokens) ---
-token_blocklist = set() # In-memory blocklist
+# --- Token Blocklist (Conceptual Persistent Store) ---
+# Placeholder for Redis Client
+class RedisClientPlaceholder:
+    def __init__(self):
+        print("INFO: Initializing RedisClientPlaceholder for token blocklist.")
+        self._blocklist = set() # Simulates Redis store
+
+    def add(self, jti: str, expires_in_seconds: int):
+        # In a real Redis client, you would use SETEX with expires_in_seconds
+        print(f"RedisClientPlaceholder: Adding JTI {jti} to blocklist for {expires_in_seconds}s (Conceptual).")
+        self._blocklist.add(jti)
+
+    def contains(self, jti: str) -> bool:
+        is_contained = jti in self._blocklist
+        print(f"RedisClientPlaceholder: Checking JTI {jti}. In blocklist: {is_contained} (Conceptual).")
+        return is_contained
+
+blocklist_client = RedisClientPlaceholder() # Instantiate the placeholder client
+
+# --- Conversation History Client (Conceptual Persistent Store) ---
+# Placeholder for DynamoDB Client for Conversation History
+class DynamoDBClientPlaceholder:
+    def __init__(self):
+        print("INFO: Initializing DynamoDBClientPlaceholder for conversation history.")
+        self._history = {} # user_id -> list of {"user": query, "assistant": response}
+
+    def save_interaction(self, user_id: str, query: str, response: str):
+        if user_id not in self._history:
+            self._history[user_id] = []
+        # Store interactions as (user_query, assistant_response) tuples
+        # for direct compatibility with existing ask_llm history loop.
+        self._history[user_id].append((query, response))
+        print(f"DynamoDBClientPlaceholder: Saved interaction for user {user_id}. Query: {query[:50]}...")
+
+    def get_history(self, user_id: str) -> list:
+        history_tuples = self._history.get(user_id, [])
+        print(f"DynamoDBClientPlaceholder: Retrieved {len(history_tuples)} history entries for user {user_id}.")
+        return history_tuples # Returns list of (user_query, assistant_response) tuples
+
+conversation_history_client = DynamoDBClientPlaceholder() # Instantiate the placeholder client
 
 # --- JWT Creation Utility ---
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -156,18 +194,18 @@ async def get_current_user_data(token: str = Depends(oauth2_scheme)) -> TokenDat
             raise credentials_exception
         if jti is None: # Check for jti presence
             raise missing_jti_exception
-        if jti in token_blocklist: # Check if jti is in blocklist
+        if blocklist_client.contains(jti): # Check if jti is in blocklist_client
             raise revoked_token_exception
-            
+
         token_data = TokenData(username=username, jti=jti)
     except JWTError:
         raise credentials_exception
-    
+
     # User existence check (still important)
     user = mock_user_db.get(token_data.username)
     if user is None:
         raise credentials_exception # Or a more specific "User not found for token"
-    
+
     return token_data
 
 async def get_current_active_user(token_data: TokenData = Depends(get_current_user_data)) -> UserInDB:
@@ -188,7 +226,7 @@ async def register_user(request: Request, user: UserCreate):
     hashed_password = get_password_hash(user.password)
     # Initialize MFA fields for new user
     user_in_db = UserInDB(
-        username=user.username, 
+        username=user.username,
         hashed_password=hashed_password,
         mfa_secret=None,
         is_mfa_enabled=False
@@ -202,7 +240,7 @@ def generate_mfa_secret() -> str:
 
 def get_provisioning_uri(username: str, secret: str) -> str:
     # Ensure issuer_name is URL-friendly if it contains spaces or special characters
-    issuer_name = "MyBankingApp" 
+    issuer_name = "MyBankingApp"
     return pyotp.totp.TOTP(secret).provisioning_uri(name=username, issuer_name=issuer_name)
 
 def verify_totp(secret: str, token: str) -> bool:
@@ -223,14 +261,14 @@ class MfaVerifyRequest(BaseModel):
 async def mfa_setup(request: Request, current_active_user: UserInDB = Depends(get_current_active_user)): # Updated dependency
     if current_active_user.is_mfa_enabled: # Use current_active_user
         raise HTTPException(status_code=400, detail="MFA is already enabled for this user.")
-    
+
     # Generate and store a new MFA secret (even if one exists but isn't enabled, overwrite for setup)
     mfa_secret = generate_mfa_secret()
     current_active_user.mfa_secret = mfa_secret # Store it, will be persisted if mock_user_db user object is updated
     # Note: In a real DB, you'd save the user object here. mock_user_db is in-memory, so changes to current_active_user reflect.
-    
+
     provisioning_uri = get_provisioning_uri(current_active_user.username, mfa_secret) # Use current_active_user
-    
+
     return MfaSetupResponse(
         provisioning_uri=provisioning_uri,
         mfa_secret_for_testing=mfa_secret # WARNING: For testing only
@@ -243,55 +281,11 @@ async def mfa_verify(req: Request, request_data: MfaVerifyRequest, current_activ
         raise HTTPException(status_code=400, detail="MFA is already enabled and verified.")
     if not current_active_user.mfa_secret: # Use current_active_user
         raise HTTPException(status_code=400, detail="MFA setup process not started. Please call /mfa/setup first.")
-        
+
     if verify_totp(current_active_user.mfa_secret, request_data.totp_code): # Use current_active_user
         current_active_user.is_mfa_enabled = True # Use current_active_user
         # Again, in a real DB, save the user object.
         print(f"MFA successfully enabled for user: {current_active_user.username}") # Use current_active_user
-        return {"message": "MFA enabled successfully."}
-    else:
-        raise HTTPException(status_code=400, detail="Invalid TOTP code.")
-
-# --- Pydantic Models for MFA Login Flow ---
-    
-    # Generate and store a new MFA secret (even if one exists but isn't enabled, overwrite for setup)
-    mfa_secret = generate_mfa_secret()
-    current_user.mfa_secret = mfa_secret # Store it, will be persisted if mock_user_db user object is updated
-    # Note: In a real DB, you'd save the user object here. mock_user_db is in-memory, so changes to current_user reflect.
-    
-    provisioning_uri = get_provisioning_uri(current_user.username, mfa_secret)
-    
-    return MfaSetupResponse(
-        provisioning_uri=provisioning_uri,
-        mfa_secret_for_testing=mfa_secret # WARNING: For testing only
-    )
-
-# --- Endpoints for Authentication (Login modified for MFA) ---
-# ... (login and login/mfa/validate remain largely the same in structure but depend on UserInDB)
-# No changes needed here for jti logic, as token creation is central.
-
-# --- Logout Endpoint ---
-@app.post("/logout")
-@limiter.limit("20/minute")
-async def logout(token_data: TokenData = Depends(get_current_user_data)): # Depends on new get_current_user_data
-    if token_data.jti:
-        token_blocklist.add(token_data.jti)
-        print(f"Token JTI {token_data.jti} for user {token_data.username} added to blocklist.")
-    else:
-        # This case should ideally not be reached if get_current_user_data enforces jti
-        print(f"Attempted to logout user {token_data.username} but JTI was missing in validated token data.")
-        raise HTTPException(status_code=500, detail="Error processing logout: JTI missing after validation.")
-    return {"message": "Successfully logged out"}
-
-
-# --- Original Models (Modified for secured /chat) ---
-    if not current_user.mfa_secret:
-        raise HTTPException(status_code=400, detail="MFA setup process not started. Please call /mfa/setup first.")
-        
-    if verify_totp(current_user.mfa_secret, request.totp_code):
-        current_user.is_mfa_enabled = True
-        # Again, in a real DB, save the user object.
-        print(f"MFA successfully enabled for user: {current_user.username}")
         return {"message": "MFA enabled successfully."}
     else:
         raise HTTPException(status_code=400, detail="Invalid TOTP code.")
@@ -302,7 +296,7 @@ class LoginMfaRequiredResponse(BaseModel):
     username: str
     message: str = "MFA is enabled for this account. Please provide TOTP code via /login/mfa/validate."
 
-class LoginMfaValidateRequest(BaseModel):
+class LoginMfaValidateRequest(BaseModel): # Restoring this definition
     username: str
     totp_code: str
 
@@ -317,12 +311,12 @@ async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequ
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     if user.is_mfa_enabled:
         if not user.mfa_secret: # Should not happen if is_mfa_enabled is true, but good check
             raise HTTPException(status_code=500, detail="MFA enabled but no secret found. Please contact support.")
         return LoginMfaRequiredResponse(username=user.username)
-    
+
     # If MFA is not enabled, issue token directly
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -336,10 +330,10 @@ async def login_mfa_validate(req: Request, request_data: LoginMfaValidateRequest
     user = mock_user_db.get(request_data.username) # Use request_data
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or TOTP code.") # Avoid user enumeration
-    
+
     if not user.is_mfa_enabled or not user.mfa_secret:
         raise HTTPException(status_code=400, detail="MFA not enabled for this user or setup incomplete.")
-        
+
     if verify_totp(user.mfa_secret, request_data.totp_code): # Use request_data
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
@@ -349,13 +343,25 @@ async def login_mfa_validate(req: Request, request_data: LoginMfaValidateRequest
     else:
         raise HTTPException(status_code=401, detail="Invalid username or TOTP code.")
 
+# --- Logout Endpoint ---
+@app.post("/logout")
+@limiter.limit("20/minute")
+async def logout(token_data: TokenData = Depends(get_current_user_data)): # Depends on new get_current_user_data
+    if token_data.jti:
+        blocklist_client.add(token_data.jti, expires_in_seconds=ACCESS_TOKEN_EXPIRE_MINUTES * 60) # Use blocklist_client
+        print(f"Token JTI {token_data.jti} for user {token_data.username} added to blocklist_client.")
+    else:
+        # This case should ideally not be reached if get_current_user_data enforces jti
+        print(f"Attempted to logout user {token_data.username} but JTI was missing in validated token data.")
+        raise HTTPException(status_code=500, detail="Error processing logout: JTI missing after validation.")
+    return {"message": "Successfully logged out"}
 
 # --- Original Models (Modified for secured /chat) ---
 class ChatRequest(BaseModel):
     query: str = Field(
-        ..., 
-        min_length=1, 
-        max_length=1000, 
+        ...,
+        min_length=1,
+        max_length=1000,
         pattern=r"^[a-zA-Z0-9\s.,?!'-]+$",
         description="User query for the banking agent. Must be between 1 and 1000 characters and contain allowed characters."
     )
@@ -374,13 +380,13 @@ async def chat_with_agent(req: Request, request_data: ChatRequest, current_activ
     User is authenticated via JWT.
     """
     # The request_data.query has already been validated by Pydantic based on ChatRequest model
-    
+
     # Conceptual: Further sanitization or query transformation could happen here.
     # For LLMs, primary defense is prompt engineering & how output is handled.
     # Example: simple check for disallowed keywords if any
     # if "some_forbidden_pattern" in request_data.query:
     #     raise HTTPException(status_code=400, detail="Invalid input pattern in query.")
-    
+
     user_id_from_token = current_active_user.username # Use current_active_user.username
     print(f"Received chat request for authenticated user_id: {user_id_from_token} with validated query: '{request_data.query}'")
 
@@ -396,20 +402,24 @@ async def chat_with_agent(req: Request, request_data: ChatRequest, current_activ
         # Option 2: Proceed with a default name if some interaction is possible without full details
         # user_name_for_llm = user_id_from_token # Or some default
         # details = {} # Ensure details is an empty dict if not found
-    
+
     user_name_for_llm = details.get("name", user_id_from_token) # Fallback to username if 'name' not in details
 
-    history = [] # For now, conversation history is not maintained across API calls
-    
+    # Load conversation history
+    history = conversation_history_client.get_history(user_id_from_token)
+
     # Conceptual: Internal validation of the full prompt before sending to LLM.
     # E.g., check for accidental inclusion of overly sensitive template markers, etc.
     # final_prompt_to_llm = construct_llm_prompt(history, request_data.query, user_name_for_llm, details) # Assuming a helper
     # if not is_valid_for_llm(final_prompt_to_llm): # Assuming a helper
     #     raise HTTPException(status_code=500, detail="Internal prompt validation error.")
 
-    print(f"Calling LLM for user '{user_name_for_llm}' (ID: {user_id_from_token}) with query: '{request_data.query}'")
+    print(f"Calling LLM for user '{user_name_for_llm}' (ID: {user_id_from_token}) with query: '{request_data.query}' and {len(history)} history entries.")
     agent_response = ask_llm(history, request_data.query, user_name_for_llm, details)
     print(f"LLM response: '{agent_response}'")
+
+    # Save current interaction to history
+    conversation_history_client.save_interaction(user_id_from_token, request_data.query, agent_response)
 
     return ChatResponse(
         response=agent_response,
@@ -427,7 +437,7 @@ if __name__ == "__main__":
     if "OPENAI_API_KEY" not in os.environ:
         print("WARNING: OPENAI_API_KEY environment variable not set. Using a dummy key for local Uvicorn run.")
         os.environ["OPENAI_API_KEY"] = "dummy_openai_key_for_uvicorn"
-    
+
     # For Google credentials, the patch applied at import time should handle it for TextToSpeechClient.
     # If other Google clients were used directly, they might also need mocking or GOOGLE_APPLICATION_CREDENTIALS.
 
